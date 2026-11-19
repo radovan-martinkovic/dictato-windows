@@ -1,0 +1,95 @@
+name: Prevod slovenskeho modelu
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Nazov vydania (release tag)"
+        default: "model-sk-v1"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      HF_REPO: kinit/parakeet-tdt-0.6b-v3-sk
+      SLUG: parakeet-tdt-0.6b-v3-sk
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Uvolnit miesto na disku
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Stiahnut transcribe.cpp
+        run: |
+          git clone --depth 1 https://github.com/handy-computer/transcribe.cpp.git tcpp
+          git -C tcpp log -1 --format='transcribe.cpp %H %cd'
+
+      - name: Nainstalovat Python balicky
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install "gguf==0.18.0" numpy pyyaml omegaconf sentencepiece huggingface_hub
+
+      - name: Stiahnut model z HuggingFace
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'EOF'
+          import os
+          from huggingface_hub import HfApi, hf_hub_download
+          repo = os.environ["HF_REPO"]
+          files = HfApi().list_repo_files(repo)
+          print("Subory v repozitari:", *files, sep="\n  ")
+          nemo = [f for f in files if f.endswith(".nemo")]
+          if not nemo:
+              raise SystemExit("V repozitari nie je ziadny .nemo subor")
+          path = hf_hub_download(repo, nemo[0], local_dir="src-model")
+          print("Stiahnute:", path)
+          with open(os.environ["GITHUB_ENV"], "a") as fh:
+              fh.write(f"NEMO_PATH={path}\n")
+          EOF
+          ls -la src-model
+
+      - name: Previest do GGUF (F32)
+        run: python scripts/convert_sk.py tcpp "$NEMO_PATH" out
+
+      - name: Zostavit nastroje transcribe.cpp
+        run: |
+          cmake -S tcpp -B tcpp/build -DCMAKE_BUILD_TYPE=Release \
+            -DTRANSCRIBE_BUILD_TOOLS=ON -DTRANSCRIBE_BUILD_TESTS=OFF -DTRANSCRIBE_BUILD_EXAMPLES=ON
+          cmake --build tcpp/build --target transcribe-quantize transcribe-cli -j"$(nproc)"
+
+      - name: Kvantovat na Q8_0
+        run: |
+          tcpp/build/bin/transcribe-quantize out/$SLUG/$SLUG-F32.gguf out/$SLUG/$SLUG-Q8_0.gguf --quant Q8_0
+          ls -la out/$SLUG
+
+      - name: Skusobny prepis (syntetizovana slovencina)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq espeak-ng ffmpeg >/dev/null
+          espeak-ng -v sk -s 140 -w tts.wav "Dobrý deň, toto je skúška slovenského diktovania. Dnes je pekné počasie a ideme na prechádzku do parku."
+          ffmpeg -loglevel error -y -i tts.wav -ar 16000 -ac 1 test-sk.wav
+          echo "--- Prepis (Q8_0, jazyk sk):"
+          tcpp/build/bin/transcribe-cli -m out/$SLUG/$SLUG-Q8_0.gguf -l sk test-sk.wav | tee prepis.txt
+          echo "--- Prepis anglickej vzorky (len kontrola nacitania):"
+          tcpp/build/bin/transcribe-cli -m out/$SLUG/$SLUG-Q8_0.gguf tcpp/samples/jfk.wav || true
+
+      - name: Zverejnit vo vydani (Release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum out/$SLUG/$SLUG-Q8_0.gguf | tee out/$SLUG/$SLUG-Q8_0.gguf.sha256
+          gh release create "${{ inputs.tag }}" \
+            out/$SLUG/$SLUG-Q8_0.gguf out/$SLUG/$SLUG-Q8_0.gguf.sha256 prepis.txt \
+            --title "Slovensky model pre Handy (${{ inputs.tag }})" \
+            --notes "Model kinit/parakeet-tdt-0.6b-v3-sk (CC BY 4.0, KInIT; odvodene od NVIDIA parakeet-tdt-0.6b-v3) prevedeny do GGUF Q8_0 pre Handy / transcribe.cpp."
